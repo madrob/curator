@@ -20,6 +20,7 @@ package org.apache.curator;
 
 import org.apache.curator.utils.CloseableUtils;
 import org.apache.curator.drivers.TracerDriver;
+import org.apache.curator.ensemble.EnsembleListener;
 import org.apache.curator.ensemble.EnsembleProvider;
 import org.apache.curator.utils.DebugUtils;
 import org.apache.curator.utils.ZookeeperFactory;
@@ -65,6 +66,12 @@ class ConnectionState implements Watcher, Closeable
         }
 
         zooKeeper = new HandleHolder(zookeeperFactory, this, ensembleProvider, sessionTimeoutMs, canBeReadOnly);
+        ensembleProvider.addListener(new EnsembleListener() {
+            @Override
+            public void ensembleChanged(EnsembleProvider provider) {
+                handleNewConnectionString();
+            }
+        });
     }
 
     ZooKeeper getZooKeeper() throws Exception
@@ -174,6 +181,21 @@ class ConnectionState implements Watcher, Closeable
 
     private synchronized void checkTimeouts() throws Exception
     {
+        long elapsed = System.currentTimeMillis() - connectionStartMs;
+        if ( elapsed >= connectionTimeoutMs )
+        {
+	    KeeperException.ConnectionLossException connectionLossException = new CuratorConnectionLossException();
+	    if ( !Boolean.getBoolean(DebugUtils.PROPERTY_DONT_LOG_CONNECTION_ISSUES) )
+	    {
+		log.error(String.format("Connection timed out for connection string (%s) and timeout (%d) / elapsed (%d)", zooKeeper.getConnectionString(), connectionTimeoutMs, elapsed), connectionLossException);
+	    }
+	    tracer.get().addCount("connections-timed-out", 1);
+	    throw connectionLossException;
+        }
+    }
+
+    private synchronized void checkTimeouts() throws Exception
+    {
         int minTimeout = Math.min(sessionTimeoutMs, connectionTimeoutMs);
         long elapsed = System.currentTimeMillis() - connectionStartMs;
         if ( elapsed >= minTimeout )
@@ -222,7 +244,6 @@ class ConnectionState implements Watcher, Closeable
     private boolean checkState(Event.KeeperState state, boolean wasConnected)
     {
         boolean isConnected = wasConnected;
-        boolean checkNewConnectionString = true;
         switch ( state )
         {
         default:
@@ -249,7 +270,6 @@ class ConnectionState implements Watcher, Closeable
         case Expired:
         {
             isConnected = false;
-            checkNewConnectionString = false;
             handleExpiredSession();
             break;
         }
@@ -259,11 +279,6 @@ class ConnectionState implements Watcher, Closeable
             // NOP
             break;
         }
-        }
-
-        if ( checkNewConnectionString && zooKeeper.hasNewConnectionString() )
-        {
-            handleNewConnectionString();
         }
 
         return isConnected;
@@ -276,7 +291,7 @@ class ConnectionState implements Watcher, Closeable
 
         try
         {
-            reset();
+            zooKeeper.handleNewConnectionString();
         }
         catch ( Exception e )
         {
